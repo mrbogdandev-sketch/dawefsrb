@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Base64 → сонификация изображения (звук = данные)</title>
+<style>
+  :root{
+    --bg:#07090d; --panel:#141821; --line:#242b38;
+    --txt:#d7e0ee; --accent:#43e8a0; --muted:#7f8ea6;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; min-height:100vh;
+    background:radial-gradient(circle at 50% 0%, #131a26 0%, #07090d 70%);
+    color:var(--txt);
+    font-family: ui-monospace, "SF Mono", Consolas, monospace;
+    display:flex; flex-direction:column; align-items:center; gap:14px; padding:18px;
+  }
+  h1{font-size:13px; font-weight:600; letter-spacing:.16em; text-transform:uppercase;
+     color:var(--muted); margin:6px 0 0; text-align:center}
+  .panel{
+    width:min(780px,100%); background:var(--panel); border:1px solid var(--line);
+    border-radius:12px; padding:12px; display:flex; flex-direction:column; gap:10px;
+  }
+  textarea{
+    width:100%; height:100px; resize:vertical; background:#0c1017; color:var(--txt);
+    border:1px solid var(--line); border-radius:8px; padding:10px;
+    font:inherit; font-size:12px; line-height:1.5; outline:none;
+  }
+  textarea:focus{border-color:var(--accent)}
+  .row{display:flex; flex-wrap:wrap; gap:10px; align-items:center}
+  button{
+    background:var(--accent); color:#04140d; border:0; border-radius:8px;
+    padding:10px 18px; font:inherit; font-weight:700; cursor:pointer; letter-spacing:.03em;
+    transition:transform .08s, filter .15s;
+  }
+  button:hover:not(:disabled){filter:brightness(1.1)}
+  button:active:not(:disabled){transform:scale(.97)}
+  button.ghost{background:transparent; color:var(--txt); border:1px solid var(--line); font-weight:500}
+  button:disabled{opacity:.35; cursor:not-allowed}
+  label{display:flex; align-items:center; gap:6px; font-size:12px; color:var(--muted)}
+  input[type=range]{accent-color:var(--accent); width:120px}
+  input[type=range]:disabled{opacity:.4}
+  input[type=checkbox]{accent-color:var(--accent); width:16px; height:16px}
+  .stage{width:min(780px,100%); display:flex; justify-content:center}
+  canvas{
+    background:#05070a; border:1px solid var(--line); border-radius:10px;
+    image-rendering:pixelated;
+    box-shadow:0 0 50px rgba(67,232,160,.10);
+  }
+  #status{font-size:12px; color:var(--muted); min-height:18px}
+  #status.err{color:#ff6b6b}
+  #status.ok{color:var(--accent)}
+  details{font-size:11.5px; color:var(--muted); border-top:1px solid var(--line); padding-top:8px}
+  details summary{cursor:pointer; color:var(--accent); outline:none; user-select:none}
+  details ul{margin:8px 0 0 0; padding-left:18px; line-height:1.6}
+  details ul ul{padding-left:16px; margin-top:2px}
+  code{color:#ffd479}
+</style>
+</head>
+<body>
+
+<h1>Base64 → изображение по пикселям · звук несёт данные</h1>
+
+<div class="panel">
+  <textarea id="input" placeholder="Вставь сюда base64 (можно с префиксом data:image/png;base64,...)"></textarea>
+
+  <div class="row">
+    <button id="decode">▶ Расшифровать и озвучить</button>
+    <button id="stop" class="ghost">■ Стоп</button>
+    <button id="demo" class="ghost">Пример</button>
+    <label>мс / пиксель
+      <input type="range" id="speed" min="4" max="60" step="1" value="8">
+      <span id="speedVal" style="width:22px;display:inline-block">8</span>
+    </label>
+    <label><input type="checkbox" id="sound" checked> Звук</label>
+  </div>
+
+  <div id="status">Готов. Вставь base64 или нажми «Пример».</div>
+
+  <details>
+    <summary>Как звук кодирует изображение (и как его расшифровать обратно)</summary>
+    <ul>
+      <li><b>Время = позиция пикселя.</b> Один пиксель — один короткий «пакет» длительностью <code>N</code> мс. Пакеты идут подряд: слева-направо, строка за строкой. Зная <code>N</code>, ширину <code>W</code> и высоту <code>H</code>, можно восстановить координаты <code>(x,y)</code> каждого пакета.</li>
+      <li><b>Цвет = три одновременные синусоиды</b> внутри пакета:
+        <ul>
+          <li>R: <code>200 + R/255 · 400</code> Гц &nbsp;(200 – 600 Гц)</li>
+          <li>G: <code>800 + G/255 · 600</code> Гц &nbsp;(800 – 1400 Гц)</li>
+          <li>B: <code>1700 + B/255 · 900</code> Гц &nbsp;(1700 – 2600 Гц)</li>
+        </ul>
+        Делая FFT по каждому пакету, вы находите три пика и обратно переводите их в R, G, B.
+      </li>
+      <li><b>Стерео-панорама</b> = горизонтальная позиция <code>x</code> (дополнительный маркер).</li>
+      <li><b>Громкость пакета</b> = яркость пикселя (для выразительности; можно игнорировать при восстановлении).</li>
+    </ul>
+  </details>
+</div>
+
+<div class="stage"><canvas id="cv" width="1" height="1"></canvas></div>
+
+<script>
+(() => {
+  "use strict";
+
+  const $ = s => document.querySelector(s);
+
+  const ta       = $("#input");
+  const btnDec   = $("#decode");
+  const btnStop  = $("#stop");
+  const btnDemo  = $("#demo");
+  const cv       = $("#cv");
+  const ctx      = cv.getContext("2d");
+  const speedEl  = $("#speed");
+  const speedVal = $("#speedVal");
+  const soundEl  = $("#sound");
+  const statusEl = $("#status");
+
+  const MAX_PIXELS = 6400;      // ограничение размера (память под аудио-буфер)
+
+  let audioCtx = null;
+  let master   = null;
+
+  let running = false;
+  let rafId   = null;
+  let audioBuffer = null;
+  let audioSource = null;
+
+  let startClock = 0;         // время начала воспроизведения
+  let pixelDur   = 0.008;     // секунд на пиксель
+  let totalPixels = 0;
+  let drawnPixels = 0;
+
+  let outImage = null;
+  let srcData  = null;
+  let imgW = 0, imgH = 0;
+
+  let lastSpeedUsed = null;
+
+  /* ---------------- статус ---------------- */
+  function setStatus(text, cls = "") {
+    statusEl.textContent = text;
+    statusEl.className = cls;
+  }
+
+  /* ---------------- аудио-контекст ---------------- */
+  function initAudio() {
+    if (!audioCtx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;
+      audioCtx = new AC();
+      master = audioCtx.createGain();
+      master.gain.value = 0.9;
+      master.connect(audioCtx.destination);
+    }
+    if (audioCtx.state === "suspended") audioCtx.resume();
+    return audioCtx;
+  }
+
+  /* ---------------- сниффинг типа ---------------- */
+  function sniffMime(b) {
+    if (b.length > 8 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4E && b[3] === 0x47) return "image/png";
+    if (b.length > 3 && b[0] === 0xFF && b[1] === 0xD8 && b[2] === 0xFF) return "image/jpeg";
+    if (b.length > 3 && b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46) return "image/gif";
+    if (b.length > 12 && b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return "image/webp";
+    if (b.length > 2 && b[0] === 0x42 && b[1] === 0x4D) return "image/bmp";
+    return "image/png";
+  }
+
+  /* ================= ГЕНЕРАЦИЯ АУДИО-БУФЕРА =================
+     Каждый пиксель → короткий пакет из трёх синусоид (R,G,B).
+     Hann-огибающая убирает щелчки и чётко отделяет пиксели.
+     ========================================================= */
+  function buildAudioBuffer(src, w, h, durSec, sampleRate) {
+    const N   = w * h;
+    const spp = durSec * sampleRate;                  // сэмплов на пиксель
+    const total = Math.ceil(N * spp);
+    const buf = audioCtx.createBuffer(2, total, sampleRate);
+    const L = buf.getChannelData(0);
+    const Rch = buf.getChannelData(1);
+
+    const TWO_PI = Math.PI * 2;
+
+    for (let i = 0; i < N; i++) {
+      const p = i << 2;
+      const a = src[p + 3];
+      if (a < 4) continue;                            // прозрачные — тишина
+
+      const r = src[p]     / 255;
+      const g = src[p + 1] / 255;
+      const b = src[p + 2] / 255;
+
+      const lum = (r + g + b) / 3;
+      const vol = 0.32 * (0.35 + 0.65 * lum) * (a / 255);
+
+      // три несущие частоты — по одной на канал цвета
+      const fR = 200  + r * 400;      //  200…600
+      const fG = 800  + g * 600;      //  800…1400
+      const fB = 1700 + b * 900;      // 1700…2600
+
+      // панорама по X
+      const x = i % w;
+      const pan = w > 1 ? x / (w - 1) : 0.5;          // 0 = слева, 1 = справа
+      const gL = Math.cos(pan * Math.PI / 2);
+      const gR = Math.sin(pan * Math.PI / 2);
+
+      const s0 = Math.floor(i * spp);
+      const s1 = Math.min(total, Math.floor((i + 1) * spp));
+      const len = s1 - s0;
+      if (len <= 0) continue;
+
+      const wR = TWO_PI * fR / sampleRate;
+      const wG = TWO_PI * fG / sampleRate;
+      const wB = TWO_PI * fB / sampleRate;
+      const eK = TWO_PI / len;                        // для Hann
+
+      for (let s = 0; s < len; s++) {
+        const env = 0.5 - 0.5 * Math.cos(eK * s);
+        const v = env * vol * (
+            0.55 * Math.sin(wR * s) +
+            0.35 * Math.sin(wG * s) +
+            0.25 * Math.sin(wB * s)
+        );
+        L[s0 + s]   += v * gL;
+        Rch[s0 + s] += v * gR;
+      }
+    }
+    return buf;
+  }
+
+  /* ---------------- подготовка канваса/данных ---------------- */
+  function prepareImage(img) {
+    const nw = img.naturalWidth, nh = img.naturalHeight;
+    const scale = Math.min(1, Math.sqrt(MAX_PIXELS / (nw * nh)));
+    const w = Math.max(1, Math.round(nw * scale));
+    const h = Math.max(1, Math.round(nh * scale));
+
+    cv.width  = w;
+    cv.height = h;
+    ctx.clearRect(0, 0, w, h);
+
+    // подгонка размера отображения
+    const maxW = Math.min(640, window.innerWidth - 60);
+    const maxH = window.innerHeight * 0.56;
+    const aspect = w / h;
+    let dispW = maxW, dispH = dispW / aspect;
+    if (dispH > maxH) { dispH = maxH; dispW = dispH * aspect; }
+    cv.style.width  = dispW + "px";
+    cv.style.height = dispH + "px";
+
+    // пиксели источника
+    const off = document.createElement("canvas");
+    off.width = w; off.height = h;
+    const octx = off.getContext("2d", { willReadFrequently: true });
+    octx.drawImage(img, 0, 0, w, h);
+    srcData = octx.getImageData(0, 0, w, h).data;
+
+    // пустая (прозрачная) картинка, будем заполнять по мере проигрывания
+    outImage = ctx.createImageData(w, h);
+    imgW = w;
+    imgH = h;
+    totalPixels = w * h;
+    drawnPixels = 0;
+  }
+
+  /* ---------------- отрисовка до target (исключая) ---------------- */
+  function drawUpTo(target) {
+    if (target <= drawnPixels) return;
+    const from = drawnPixels;
+    const to   = Math.min(target, totalPixels);
+    const o = outImage.data;
+
+    for (let i = from; i < to; i++) {
+      const p = i << 2;
+      o[p]     = srcData[p];
+      o[p + 1] = srcData[p + 1];
+      o[p + 2] = srcData[p + 2];
+      o[p + 3] = srcData[p + 3];
+    }
+
+    const y0 = Math.floor(from / imgW);
+    const y1 = Math.floor((to - 1) / imgW);
+    ctx.putImageData(outImage, 0, 0, 0, y0, imgW, y1 - y0 + 1);
+    drawnPixels = to;
+  }
+
+  /* ---------------- главный цикл ---------------- */
+  function renderLoop() {
+    if (!running) return;
+
+    let elapsed;
+    if (soundEl.checked && audioCtx) {
+      elapsed = audioCtx.currentTime - startClock;
+    } else {
+      elapsed = (performance.now() - startClock) / 1000;
+    }
+
+    const target = Math.min(totalPixels, Math.floor(elapsed / pixelDur) + 1);
+    drawUpTo(target);
+
+    if (target >= totalPixels) {
+      running = false;
+      btnDec.disabled = false;
+      btnStop.disabled = true;
+      speedEl.disabled = false;
+      setStatus(`✅ Готово: ${imgW}×${imgH}, ${totalPixels} пикселей · ${(totalPixels * pixelDur).toFixed(1)} с`, "ok");
+      return;
+    }
+
+    const pct = Math.round((target / totalPixels) * 100);
+    setStatus(`▶ ${pct}%  (${target} / ${totalPixels})  ·  звучит пиксель #${target}`);
+
+    rafId = requestAnimationFrame(renderLoop);
+  }
+
+  /* ---------------- старт воспроизведения ---------------- */
+  function startPlayback() {
+    const wantSound = soundEl.checked;
+    if (wantSound) initAudio();
+
+    if (wantSound && audioCtx) {
+      setStatus("Синтезирую звук из пикселей…");
+      // Небольшая задержка, чтобы UI успел перерисоваться
+      requestAnimationFrame(() => {
+        audioBuffer = buildAudioBuffer(srcData, imgW, imgH, pixelDur, audioCtx.sampleRate);
+
+        audioSource = audioCtx.createBufferSource();
+        audioSource.buffer = audioBuffer;
+        audioSource.connect(master);
+        audioSource.start();
+
+        startClock = audioCtx.currentTime;
+        running = true;
+        rafId = requestAnimationFrame(renderLoop);
+      });
+    } else {
+      startClock = performance.now();
+      running = true;
+      rafId = requestAnimationFrame(renderLoop);
+    }
+  }
+
+  /* ---------------- полная остановка ---------------- */
+  function stopAll(silent) {
+    running = false;
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = null;
+    if (audioSource) {
+      try { audioSource.onended = null; audioSource.stop(); } catch (e) {}
+      audioSource = null;
+    }
+    btnDec.disabled = false;
+    btnStop.disabled = true;
+    speedEl.disabled = false;
+    if (!silent) setStatus("Остановлено");
+  }
+
+  /* ---------------- декодирование и запуск ---------------- */
+  function decodeAndPlay() {
+    stopAll(true);
+
+    let raw = ta.value.trim();
+    if (!raw) { setStatus("Сначала вставь base64-строку", "err"); return; }
+
+    raw = raw
+      .replace(/^\s*data:image\/[a-z0-9.+-]+;base64,/i, "")
+      .replace(/-/g, "+").replace(/_/g, "/")
+      .replace(/[^A-Za-z0-9+/=]/g, "");
+
+    if (!raw) { setStatus("Base64-данные не найдены", "err"); return; }
+    while (raw.length % 4) raw += "=";
+
+    let bytes;
+    try {
+      const bin = atob(raw);
+      bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    } catch (e) {
+      setStatus("Ошибка: строка не является корректным base64", "err");
+      return;
+    }
+
+    // фиксируем настройки на этот запуск
+    pixelDur = (+speedEl.value) / 1000;
+    lastSpeedUsed = +speedEl.value;
+
+    const blob = new Blob([bytes], { type: sniffMime(bytes) });
+    const url  = URL.createObjectURL(blob);
+    const img  = new Image();
+
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      prepareImage(img);
+      btnDec.disabled = true;
+      btnStop.disabled = false;
+      speedEl.disabled = true;
+      setStatus(`Источник ${img.naturalWidth}×${img.naturalHeight} → сетка ${imgW}×${imgH}, звук ${(totalPixels * pixelDur).toFixed(1)} с`);
+      startPlayback();
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      setStatus("Не удалось распознать изображение", "err");
+    };
+    img.src = url;
+  }
+
+  /* ---------------- кнопки / слайдеры ---------------- */
+  btnDec.addEventListener("click", decodeAndPlay);
+  btnStop.addEventListener("click", () => stopAll(false));
+
+  speedEl.addEventListener("input", () => {
+    speedVal.textContent = speedEl.value;
+  });
+
+  // Пример: 64×64 градиент с кольцом
+  btnDemo.addEventListener("click", () => {
+    const S = 64;
+    const c = document.createElement("canvas");
+    c.width = S; c.height = S;
+    const g = c.getContext("2d");
+
+    for (let y = 0; y < S; y++) {
+      for (let x = 0; x < S; x++) {
+        const hue = (x / S) * 320;
+        const lig = 18 + (1 - y / S) * 62;
+        g.fillStyle = `hsl(${hue} 88% ${lig}%)`;
+        g.fillRect(x, y, 1, 1);
+      }
+    }
+    g.beginPath();
+    g.arc(S / 2, S / 2, S * 0.30, 0, Math.PI * 2);
+    g.lineWidth = S * 0.055;
+    g.strokeStyle = "rgba(255,255,255,0.92)";
+    g.stroke();
+    g.beginPath();
+    g.arc(S / 2, S / 2, S * 0.10, 0, Math.PI * 2);
+    g.fillStyle = "rgba(255,255,255,0.95)";
+    g.fill();
+
+    ta.value = c.toDataURL("image/png").split(",")[1];
+    setStatus("Пример загружен — жми «Расшифровать и озвучить»");
+  });
+
+  // Ctrl/Cmd+Enter — запуск
+  ta.addEventListener("keydown", e => {
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+      e.preventDefault();
+      decodeAndPlay();
+    }
+  });
+
+  btnStop.disabled = true;
+})();
+</script>
+</body>
+</html>

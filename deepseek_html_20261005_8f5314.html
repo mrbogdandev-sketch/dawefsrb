@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Дедушкин декодер · аудио → изображение</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    background: #0e0f12; color: #dcdcdc; margin: 0; padding: 24px;
+  }
+  h1 { font-size: 19px; margin: 0 0 4px; font-weight: 600; letter-spacing: .2px; }
+  .sub { font-size: 12px; color: #7d8590; margin-bottom: 20px; }
+  .panel {
+    display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-end;
+    background: #16181d; border: 1px solid #23262d; border-radius: 10px;
+    padding: 16px; margin-bottom: 12px;
+  }
+  label { display: flex; flex-direction: column; font-size: 11px; gap: 5px; color: #8b93a1; text-transform: uppercase; letter-spacing: .5px; }
+  input[type=number], input[type=file] {
+    background: #1e2127; color: #eaeaea; border: 1px solid #2e323b;
+    padding: 7px 9px; border-radius: 6px; font-size: 13px; font-family: inherit;
+  }
+  input[type=number] { width: 92px; }
+  input[type=file] { min-width: 220px; }
+  button {
+    background: #2f9e6a; color: #04140c; border: 0; padding: 9px 18px;
+    border-radius: 6px; cursor: pointer; font-weight: 700; font-size: 13px;
+    font-family: inherit; white-space: nowrap;
+  }
+  button.rec { background: #d94a4a; color: #2a0505; }
+  button.stop { background: #3a3f4a; color: #e6e6e6; }
+  button.secondary { background: #2a2e37; color: #cfd6e0; }
+  button:disabled { opacity: .35; cursor: default; }
+  button:not(:disabled):hover { filter: brightness(1.1); }
+  #bar { height: 5px; background: #1c1f25; border-radius: 3px; overflow: hidden; margin: 0 0 16px; }
+  #barfill { height: 100%; width: 0%; background: linear-gradient(90deg,#2f9e6a,#61d39a); transition: width .08s linear; }
+  .stage { display: flex; gap: 18px; flex-wrap: wrap; align-items: flex-start; }
+  canvas {
+    image-rendering: pixelated; background: #000;
+    border: 1px solid #262a32; border-radius: 6px; max-width: 100%;
+  }
+  #log {
+    font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px;
+    white-space: pre-wrap; color: #7fd6a6; background: #12141a;
+    border: 1px solid #23262d; border-radius: 8px; padding: 12px;
+    min-width: 280px; flex: 1; max-height: 460px; overflow: auto; line-height: 1.5;
+  }
+  .hint { font-size: 11px; color: #666e7a; margin-top: 14px; line-height: 1.6; }
+  code { color: #9aa4b2; background: #1a1d23; padding: 1px 5px; border-radius: 4px; }
+  .rec-dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#d94a4a; margin-right:6px; vertical-align:middle; animation: pulse 1s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:.25;} }
+</style>
+</head>
+<body>
+
+<h1>Дедушкин декодер</h1>
+<div class="sub">Время = позиция пикселя · Цвет = три синусоиды внутри пакета</div>
+
+<div class="panel">
+  <label>Аудиофайл
+    <input type="file" id="file" accept="audio/*">
+  </label>
+  <label>N, мс/пакет
+    <input type="number" id="nms" value="20" min="5" max="500" step="1">
+  </label>
+  <label>Ширина W
+    <input type="number" id="w" value="128" min="1" max="2048" step="1">
+  </label>
+  <label>Высота H
+    <input type="number" id="h" value="128" min="1" max="2048" step="1">
+  </label>
+  <button id="go" disabled>Декодировать файл</button>
+  <button id="mic" class="rec">🎤 С микрофона</button>
+  <button id="stop" class="stop" disabled>⏹ Стоп</button>
+  <button id="save" class="secondary" disabled>Скачать PNG</button>
+</div>
+
+<div id="bar"><div id="barfill"></div></div>
+
+<div class="stage">
+  <canvas id="canvas" width="128" height="128"></canvas>
+  <div id="log">Готов к работе.</div>
+</div>
+
+<div class="hint">
+  Диапазоны: <code>R 200–600 Гц</code> · <code>G 800–1400 Гц</code> · <code>B 1700–2600 Гц</code>.
+  Для файла аудио децимируется до ~8 кГц — выше 2600 Гц всё равно ничего нет.
+  Для микрофона частота берётся как есть (по возможности 8 кГц).
+  Громкость пакета игнорируется.
+</div>
+
+<script>
+"use strict";
+
+const $ = id => document.getElementById(id);
+const fileEl = $('file'), nEl = $('nms'), wEl = $('w'), hEl = $('h');
+const goBtn = $('go'), micBtn = $('mic'), stopBtn = $('stop'), saveBtn = $('save');
+const canvas = $('canvas'), ctx2d = canvas.getContext('2d', { willReadFrequently: true });
+const logEl = $('log'), barFill = $('barfill');
+
+/* ================================================================== *
+ *  FFT: итеративная Кули–Тьюки на месте, длина — степень двойки
+ * ================================================================== */
+function fft(re, im) {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      let t = re[i]; re[i] = re[j]; re[j] = t;
+      t = im[i]; im[i] = im[j]; im[j] = t;
+    }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const half = len >> 1;
+    const ang = -2 * Math.PI / len;
+    const wr = Math.cos(ang), wi = Math.sin(ang);
+    for (let i = 0; i < n; i += len) {
+      let cr = 1, ci = 0;
+      for (let k = 0; k < half; k++) {
+        const ar = re[i + k],        ai = im[i + k];
+        const br = re[i + k + half], bi = im[i + k + half];
+        const vr = br * cr - bi * ci;
+        const vi = br * ci + bi * cr;
+        re[i + k]        = ar + vr;  im[i + k]        = ai + vi;
+        re[i + k + half] = ar - vr;  im[i + k + half] = ai - vi;
+        const ncr = cr * wr - ci * wi;
+        ci = cr * wi + ci * wr;
+        cr = ncr;
+      }
+    }
+  }
+}
+
+/* ================================================================== *
+ *  Пик в полосе + параболическая интерполяция по log|X|
+ * ================================================================== */
+function peakInBand(mag, binLo, binHi) {
+  binLo = Math.max(1, binLo);
+  binHi = Math.min(mag.length - 2, binHi);
+  if (binHi < binLo) return { bin: binLo, mag: 0 };
+
+  let best = binLo, bestV = -Infinity;
+  for (let i = binLo; i <= binHi; i++) {
+    if (mag[i] > bestV) { bestV = mag[i]; best = i; }
+  }
+  if (!(bestV > 0)) return { bin: best, mag: 0 };
+
+  const la = Math.log(mag[best - 1] + 1e-12);
+  const lb = Math.log(bestV        + 1e-12);
+  const lc = Math.log(mag[best + 1] + 1e-12);
+  const den = la - 2 * lb + lc;
+  let d = den !== 0 ? 0.5 * (la - lc) / den : 0;
+  if (d >  0.5) d =  0.5;
+  if (d < -0.5) d = -0.5;
+
+  return { bin: best + d, mag: bestV };
+}
+
+const clamp255 = v => v < 0 ? 0 : v > 255 ? 255 : v;
+const log = s => { logEl.textContent = s; };
+
+/* ================================================================== *
+ *  Универсальный декодер одного пакета: samples → [R,G,B]
+ * ================================================================== */
+function buildDecoder(spp, fs) {
+  let fftSize = 1;
+  while (fftSize < spp) fftSize <<= 1;
+  fftSize = Math.max(256, Math.min(16384, fftSize));
+
+  const win = new Float32Array(spp);
+  for (let i = 0; i < spp; i++) {
+    win[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (spp - 1 || 1));
+  }
+
+  const re  = new Float64Array(fftSize);
+  const im  = new Float64Array(fftSize);
+  const mag = new Float32Array(fftSize >> 1);
+
+  const binOf = hz => hz * fftSize / fs;
+  const bR0 = Math.max(1, Math.ceil(binOf(200))),  bR1 = Math.floor(binOf(600));
+  const bG0 = Math.max(1, Math.ceil(binOf(800))),  bG1 = Math.floor(binOf(1400));
+  const bB0 = Math.max(1, Math.ceil(binOf(1700))), bB1 = Math.floor(binOf(2600));
+
+  return function (samples) {
+    re.fill(0); im.fill(0);
+    const n = Math.min(spp, samples.length);
+    for (let i = 0; i < n; i++) re[i] = samples[i] * win[i];
+
+    fft(re, im);
+
+    const half = fftSize >> 1;
+    for (let i = 0; i < half; i++) mag[i] = Math.hypot(re[i], im[i]);
+
+    const pr = peakInBand(mag, bR0, bR1);
+    const pg = peakInBand(mag, bG0, bG1);
+    const pb = peakInBand(mag, bB0, bB1);
+
+    const fR = pr.bin * fs / fftSize;
+    const fG = pg.bin * fs / fftSize;
+    const fB = pb.bin * fs / fftSize;
+
+    return [
+      clamp255(Math.round((fR - 200)  / 400 * 255)),
+      clamp255(Math.round((fG - 800)  / 600 * 255)),
+      clamp255(Math.round((fB - 1700) / 900 * 255))
+    ];
+  };
+}
+
+/* ================================================================== *
+ *  РЕЖИМ 1: декодирование готового файла
+ * ================================================================== */
+let hasFile = false;
+
+async function decodeFile() {
+  const f = fileEl.files[0];
+  if (!f) return;
+
+  goBtn.disabled = true; micBtn.disabled = true; saveBtn.disabled = true;
+  barFill.style.width = '0%';
+  log('Читаю файл…');
+
+  let audioBuf;
+  try {
+    const ab = await f.arrayBuffer();
+    const AC = window.AudioContext || window.webkitAudioContext;
+    const ac = new AC();
+    audioBuf = await ac.decodeAudioData(ab);
+    ac.close();
+  } catch (e) {
+    log('Ошибка декодирования аудио: ' + e.message);
+    goBtn.disabled = false; micBtn.disabled = false;
+    return;
+  }
+
+  const fs0 = audioBuf.sampleRate;
+  const chans = audioBuf.numberOfChannels;
+
+  let src = audioBuf.getChannelData(0);
+  if (chans > 1) {
+    const b = audioBuf.getChannelData(1);
+    const mix = new Float32Array(src.length);
+    for (let i = 0; i < src.length; i++) mix[i] = 0.5 * (src[i] + b[i]);
+    src = mix;
+  }
+
+  // Децимация до ~8 кГц — выше 2600 Гц в сигнале нет ничего,
+  // а более низкая fs даёт лучшее разрешение по частоте при той же N.
+  let ds, fs;
+  if (fs0 > 16000) {
+    const M = Math.max(1, Math.round(fs0 / 8000));
+    const nOut = Math.floor(src.length / M);
+    ds = new Float32Array(nOut);
+    for (let i = 0; i < nOut; i++) {
+      let s = 0;
+      const o = i * M;
+      for (let j = 0; j < M; j++) s += src[o + j];
+      ds[i] = s / M;
+    }
+    fs = fs0 / M;
+  } else {
+    ds = src;
+    fs = fs0;
+  }
+
+  const Nms = Math.max(5, +nEl.value || 20);
+  const W = Math.max(1, Math.min(2048, +wEl.value || 128));
+  const H = Math.max(1, Math.min(2048, +hEl.value || 128));
+
+  const spp = Math.max(16, Math.round(Nms / 1000 * fs));
+  const decodeChunk = buildDecoder(spp, fs);
+
+  const totalPackets = Math.floor(ds.length / spp);
+  const totalPixels  = W * H;
+  const count        = Math.min(totalPackets, totalPixels);
+
+  log(
+    `Файл: ${f.name}\n` +
+    `Исходный sample rate : ${fs0} Гц, каналов: ${chans}\n` +
+    `Рабочий sample rate  : ${fs.toFixed(1)} Гц\n` +
+    `Длина                : ${audioBuf.duration.toFixed(2)} с\n` +
+    `Пакет                : ${Nms} мс = ${spp} отсч.\n` +
+    `Пакетов в файле      : ${totalPackets}\n` +
+    `Пикселей W×H         : ${W}×${H} = ${totalPixels}\n` +
+    (totalPackets < totalPixels
+      ? `ВНИМАНИЕ: пакетов меньше, чем пикселей — низ кадра останется чёрным.\n`
+      : totalPackets > totalPixels
+        ? `ВНИМАНИЕ: пакетов больше, чем пикселей — лишние будут отброшены.\n`
+        : '') +
+    `\nОбрабатываю…`
+  );
+
+  canvas.width = W; canvas.height = H;
+  const img = ctx2d.createImageData(W, H);
+  const px  = img.data;
+
+  const CHUNK = 3000;
+  let p = 0;
+
+  while (p < count) {
+    const end = Math.min(count, p + CHUNK);
+    for (; p < end; p++) {
+      const [R, G, B] = decodeChunk(ds.subarray(p * spp, p * spp + spp));
+      const o = p * 4;
+      px[o] = R; px[o + 1] = G; px[o + 2] = B; px[o + 3] = 255;
+    }
+    barFill.style.width = (p / count * 100).toFixed(1) + '%';
+    await new Promise(r => setTimeout(r, 0));
+  }
+
+  for (let i = count; i < totalPixels; i++) {
+    const o = i * 4;
+    px[o] = px[o + 1] = px[o + 2] = 0;
+    px[o + 3] = 255;
+  }
+
+  ctx2d.putImageData(img, 0, 0);
+  barFill.style.width = '100%';
+  saveBtn.disabled = false;
+  goBtn.disabled = false; micBtn.disabled = false;
+
+  log(
+    `Готово. Восстановлено ${count} пикселей из ${totalPackets} пакетов.\n` +
+    `Изображение ${W}×${H} построено.`
+  );
+}
+
+/* ================================================================== *
+ *  РЕЖИМ 2: живой микрофон
+ * ================================================================== */
+let mic = null;   // { ac, stream, src, node, mute, rafId, img, W, H, pixel, total }
+
+async function startMic() {
+  stopMic();
+
+  const Nms = Math.max(5, +nEl.value || 20);
+  const W = Math.max(1, Math.min(2048, +wEl.value || 128));
+  const H = Math.max(1, Math.min(2048, +hEl.value || 128));
+
+  canvas.width = W; canvas.height = H;
+  const img = ctx2d.createImageData(W, H);
+  for (let i = 3; i < img.data.length; i += 4) img.data[i] = 255;
+  ctx2d.putImageData(img, 0, 0);
+  barFill.style.width = '0%';
+
+  // --- AudioContext с желаемой частотой 8000 Гц (для лучшего разрешения по частоте) ---
+  let ac;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  try {
+    ac = new AC({ sampleRate: 8000 });
+  } catch (e) {
+    ac = new AC();
+  }
+  await ac.resume();
+
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+        channelCount: 1
+      }
+    });
+  } catch (e) {
+    log('Не удалось получить доступ к микрофону: ' + e.message);
+    try { ac.close(); } catch (_) {}
+    return;
+  }
+
+  const fs = ac.sampleRate;
+  const spp = Math.max(16, Math.round(Nms / 1000 * fs));
+  const decodeChunk = buildDecoder(spp, fs);
+
+  const src = ac.createMediaStreamSource(stream);
+  const node = ac.createScriptProcessor(1024, 1, 1);
+  const mute = ac.createGain();
+  mute.gain.value = 0;  // не слушаем себя — иначе свист
+
+  src.connect(node);
+  node.connect(mute);
+  mute.connect(ac.destination);
+
+  const acc = new Float32Array(spp);
+  let accLen = 0;
+  let pixel  = 0;
+  const total = W * H;
+  let dirty = false;
+
+  node.onaudioprocess = ev => {
+    const input = ev.inputBuffer.getChannelData(0);
+    for (let i = 0; i < input.length; i++) {
+      acc[accLen++] = input[i];
+      if (accLen >= spp) {
+        if (pixel < total) {
+          const [R, G, B] = decodeChunk(acc);
+          const x = pixel % W;
+          const y = (pixel / W) | 0;
+          const o = (y * W + x) * 4;
+          img.data[o]     = R;
+          img.data[o + 1] = G;
+          img.data[o + 2] = B;
+          pixel++;
+          dirty = true;
+        }
+        accLen = 0;
+      }
+    }
+  };
+
+  let rafId;
+  const draw = () => {
+    if (dirty) {
+      ctx2d.putImageData(img, 0, 0);
+      dirty = false;
+      barFill.style.width = (pixel / total * 100).toFixed(1) + '%';
+    }
+    rafId = requestAnimationFrame(draw);
+  };
+  rafId = requestAnimationFrame(draw);
+
+  mic = { ac, stream, src, node, mute, rafId, img, W, H, pixel, total };
+
+  goBtn.disabled = true;
+  micBtn.disabled = true;
+  stopBtn.disabled = false;
+  saveBtn.disabled = false;
+
+  log(
+    `🎤 Микрофон запущен.\n` +
+    `Sample rate : ${fs} Гц\n` +
+    `Пакет       : ${Nms} мс = ${spp} отсч.\n` +
+    `Разрешение  : ${W}×${H} = ${total} пикселей\n\n` +
+    `Воспроизведите сигнал (или спойте/сыграйте) — картинка заполняется\n` +
+    `слева-направо, строка за строкой. Жми «Стоп», когда готово.`
+  );
+}
+
+function stopMic() {
+  if (!mic) return;
+  cancelAnimationFrame(mic.rafId);
+  try { mic.node.onaudioprocess = null; } catch (_) {}
+  try { mic.node.disconnect(); } catch (_) {}
+  try { mic.src.disconnect(); } catch (_) {}
+  try { mic.mute.disconnect(); } catch (_) {}
+  try { mic.stream.getTracks().forEach(t => t.stop()); } catch (_) {}
+  try { mic.ac.close(); } catch (_) {}
+
+  const done = mic.pixel;
+  mic = null;
+
+  stopBtn.disabled = true;
+  micBtn.disabled = false;
+  goBtn.disabled = !hasFile;
+  saveBtn.disabled = false;
+
+  log(`Микрофон остановлен. Заполнено ${done} пикселей.`);
+}
+
+/* ================================================================== *
+ *  UI
+ * ================================================================== */
+fileEl.addEventListener('change', () => {
+  hasFile = !!fileEl.files.length;
+  goBtn.disabled = !hasFile;
+  saveBtn.disabled = true;
+  logEl.textContent = hasFile
+    ? 'Файл выбран. Нажмите «Декодировать файл».'
+    : 'Готов к работе.';
+});
+
+goBtn.addEventListener('click', () => {
+  decodeFile().catch(e => {
+    log('Ошибка: ' + (e && e.stack || e));
+    goBtn.disabled = false; micBtn.disabled = false;
+  });
+});
+
+micBtn.addEventListener('click', () => {
+  startMic().catch(e => {
+    log('Ошибка: ' + (e && e.stack || e));
+    micBtn.disabled = false;
+  });
+});
+
+stopBtn.addEventListener('click', stopMic);
+
+saveBtn.addEventListener('click', () => {
+  canvas.toBlob(blob => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'decoded.png';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  }, 'image/png');
+});
+</script>
+</body>
+</html>
